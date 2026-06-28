@@ -14,7 +14,7 @@ When you have many PDFs or snapshots open at once, the Zotero tab bar becomes a 
 - **Click a chip** to collapse the group — the tabs fold away and the chip shows a count badge. Click again to expand.
 - **Right-click a chip** for a context menu with **"Close all tabs in …"**.
 - **Right-click a tab** for a **"Move to group"** submenu to reassign it to any existing group, start a **"New group…"** for it, or **"Remove from group"** to ungroup it entirely.
-- **Drag a tab** onto a group chip to move it into that group.
+- **Drag a tab** onto a group chip — or onto any tab already in the group — to move it into that group. Any tab can be dragged, whether or not it's currently grouped.
 - Manual assignments (via right-click or drag) **persist** — they survive the button being clicked again and Zotero restarts.
 - **Right-click items** in the item list for an **"Open in tab group(s)"** option that opens and groups them in one step.
 - When there are multiple groups, all start **collapsed** so you get an instant overview. When everything belongs to one collection the group starts expanded (collapsing it would leave nothing visible).
@@ -38,10 +38,7 @@ When you have many PDFs or snapshots open at once, the Zotero tab bar becomes a 
 
 **Subsequent runs** (groups already exist): the button only processes tabs that are not yet assigned to any group. Already-grouped tabs — including any you have manually moved — are left exactly where they are. If an ungrouped tab belongs to a collection that already has a group, it is added to that group. If it belongs to a new collection, a new group is created for it. This means you can open a handful of new papers, click the button once, and only those new papers are slotted in, without disturbing anything else.
 
-If a tab's item belongs to **multiple (sibling) collections**, the plugin first tries to avoid asking: if one of those collections **already has a group**, the tab is slotted there automatically. Only when none of them does:
-- **Via the button**: a confirmation dialog lists each remaining conflict and its suggested collection. If you proceed, the choice is **remembered** (stored as a manual assignment) so you are never prompted for that paper again. You can still move it afterwards via right-click or drag.
-- **Via auto-assign** (tab opened directly from the library while groups are active): the tab is silently placed into the first matching group, with no prompt.
-- **On restart restore**: conflicts are resolved silently, preferring a collection that matches a saved group.
+If a tab's item belongs to **multiple (sibling) collections**, the plugin resolves it silently — no dialog. If one of those collections **already has a group**, the tab is slotted there; otherwise it goes to the first collection by the standard ordering. You can always re-home it afterwards via right-click or drag, and that choice is remembered.
 
 (A paper can only live in one group at a time, since a group is a contiguous run of tabs and a tab can't be in two places at once.)
 

@@ -101,6 +101,30 @@
 	outline-offset: 1px;
 }
 
+/* Drop-target highlight when a tab is dragged over another group's tab */
+.tab.gtbc-drop-into {
+	outline: 2px solid rgba(255, 255, 255, 0.8);
+	outline-offset: -2px;
+}
+
+/* ── Selected-tab emphasis ───────────────────────────────────────────────── */
+
+/*
+ * The active tab is hard to spot once a group tint is painted over it (the
+ * plugin sets background-color inline on grouped tabs, which hides Zotero's
+ * own selected styling). Re-assert a clear highlight using box-shadow + filter,
+ * which layer on top of the inline background. currentColor tracks the tab's
+ * text colour, so the cue stays visible against any group colour and in both
+ * light and dark themes.
+ */
+.tab.selected,
+.tab[aria-selected="true"] {
+	box-shadow: inset 0 0 0 2px currentColor,
+	            inset 0 -3px 0 0 currentColor;
+	filter: brightness(1.12) contrast(1.04);
+	font-weight: 700 !important;
+}
+
 /* Coloured dot — slightly lighter than the pill background */
 .gtbc-chip-dot {
 	display: inline-block;

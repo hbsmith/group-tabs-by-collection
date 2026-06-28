@@ -299,8 +299,7 @@ var GroupTabsByCollection = {
 		const tabInfos = await this._buildTabInfos(readerTabs);
 		const overrides = new Map(existingState?.overrides ?? []);
 
-		if (!this._resolveConflicts(window, tabInfos, overrides, existingState))
-			return;
+		this._resolveConflicts(window, tabInfos, overrides, existingState);
 
 		this._applyGrouping(window, tabInfos, ZoteroTabs, overrides);
 		this._buildGroupState(window, tabInfos, overrides);
@@ -309,40 +308,24 @@ var GroupTabsByCollection = {
 		this._saveState(window);
 	},
 
-	// Resolve multi-collection (sibling) conflicts in place.  Policy:
+	// Resolve multi-collection (sibling) conflicts silently, in place:
 	//   1. Skip tabs that already have a manual override.
-	//   2. Prefer a candidate collection that already has a group — slot the tab
-	//      there silently, minimising fragmentation.
-	//   3. For anything still ambiguous, ask ONCE (batch dialog) and record the
-	//      chosen default as an override so the decision is remembered and the
-	//      user is never prompted for the same paper again.
-	// Returns false only if the user cancels the dialog.
+	//   2. Prefer a candidate collection that already has a group, minimising
+	//      fragmentation.
+	//   3. Otherwise pick the first candidate by the standard ordering.
+	// No prompt — a tab can only live in one group, and the user can always
+	// re-home it afterwards via right-click or drag.
 	_resolveConflicts(window, tabInfos, overrides, existingState) {
 		const existingKeys = new Set(
 			(existingState?.groups ?? []).map((g) => g.key)
 		);
-		const conflicts = tabInfos.filter(
-			(ti) =>
-				ti.descriptors.length > 1 &&
-				!ti.selected &&
-				!overrides.has(ti.tab.id)
-		);
-		if (conflicts.length === 0) return true;
-
-		const stillConflicting = [];
-		for (const ti of conflicts) {
-			const pref = ti.descriptors.find((d) => existingKeys.has(d.key));
-			if (pref) ti.selected = pref; // prefer-existing, not remembered
-			else stillConflicting.push(ti);
+		for (const ti of tabInfos) {
+			if (ti.selected || ti.descriptors.length <= 1) continue;
+			if (overrides.has(ti.tab.id)) continue;
+			ti.selected =
+				ti.descriptors.find((d) => existingKeys.has(d.key)) ??
+				ti.descriptors.slice().sort((a, b) => this._compareGroups(a, b))[0];
 		}
-		if (stillConflicting.length === 0) return true;
-
-		if (!this._handleConflicts(window, stillConflicting)) return false;
-		// Remember the resolved default so we don't ask again.
-		for (const ti of stillConflicting) {
-			if (ti.selected) overrides.set(ti.tab.id, ti.selected.key);
-		}
-		return true;
 	},
 
 	// Incremental grouping: called when groups already exist.
@@ -357,7 +340,7 @@ var GroupTabsByCollection = {
 
 		const tabInfos = await this._buildTabInfos(newTabs);
 		if (!st.overrides) st.overrides = new Map();
-		if (!this._resolveConflicts(window, tabInfos, st.overrides, st)) return;
+		this._resolveConflicts(window, tabInfos, st.overrides, st);
 
 		// Create an (empty) group entry for any group key not yet represented;
 		// _autoAssignNewTabs then assigns and physically positions the tabs.
@@ -384,6 +367,7 @@ var GroupTabsByCollection = {
 
 		if (st.tabBarObs) st.tabBarObs.disconnect();
 		this._autoAssignNewTabs(window);
+		this._reflowTabs(window);
 		this._renderGroupChips(window, "groupTabs");
 		const tabBar = window.document.getElementById("tab-bar-container");
 		if (st.tabBarObs && tabBar) st.tabBarObs.observe(tabBar, { childList: true, subtree: true });
@@ -405,55 +389,6 @@ var GroupTabsByCollection = {
 			});
 		}
 		return infos;
-	},
-
-	_handleConflicts(window, conflicts) {
-		for (const ci of conflicts) {
-			ci.selected = ci.descriptors
-				.slice()
-				.sort((a, b) => this._compareGroups(a, b))[0];
-		}
-
-		const lines = conflicts.map((ci) => {
-			const title = this._truncate(
-				ci.item?.getDisplayTitle?.() || ci.tab.title || "Untitled",
-				52
-			);
-			const all = ci.descriptors
-				.map((d) => this._descriptorDisplay(d))
-				.sort()
-				.join(", ");
-			return (
-				`\u2022 "${title}"\n` +
-				`   In: ${all}\n` +
-				`   \u2192 Will group under: ${this._descriptorDisplay(ci.selected)}`
-			);
-		});
-
-		const msg =
-			`${conflicts.length} tab(s) belong to multiple collections:\n\n` +
-			lines.join("\n\n") +
-			`\n\nProceed? (Each will be placed under the suggested collection.)`;
-
-		const flags =
-			Services.prompt.BUTTON_POS_0 *
-				Services.prompt.BUTTON_TITLE_IS_STRING +
-			Services.prompt.BUTTON_POS_1 *
-				Services.prompt.BUTTON_TITLE_IS_STRING;
-
-		return (
-			Services.prompt.confirmEx(
-				window,
-				"Group Tabs by Collection — Conflicts",
-				msg,
-				flags,
-				"Group (use suggested)",
-				"Cancel",
-				"",
-				null,
-				{}
-			) === 0
-		);
 	},
 
 	_applyGrouping(window, tabInfos, ZoteroTabs, overrides = new Map(), knownGroups = new Map()) {
@@ -645,11 +580,30 @@ var GroupTabsByCollection = {
 			}
 		}
 
-		// 6. Insert a chip before each group's first *open* tab.
+		// 5b. Make every reader/note tab draggable (grouped tabs already are from
+		//     step 5) so any tab — including ungrouped ones — can be dragged into
+		//     a group.
+		for (const tab of allReaderTabs) {
+			const el = tabBar.querySelector(`.tab[data-id="${tab.id}"]`);
+			if (el) el.setAttribute("draggable", "true");
+		}
+
+		// 6. Insert a chip before each group's physically-leftmost open tab, so the
+		//    group-name chip always sits at the left edge of its run even if the
+		//    tabId order and DOM order have momentarily diverged.
+		const liveOrder = new Map(
+			(ZoteroTabs?._tabs || []).map((t, i) => [t.id, i])
+		);
 		for (const g of st.groups) {
-			const firstOpenId = g.tabIds.find((id) => openTabIds.has(id));
-			if (!firstOpenId) continue;
-			const anchorEl = tabBar.querySelector(`.tab[data-id="${firstOpenId}"]`);
+			let leftmostId = null;
+			let leftmostIdx = Infinity;
+			for (const id of g.tabIds) {
+				if (!openTabIds.has(id)) continue;
+				const i = liveOrder.has(id) ? liveOrder.get(id) : Infinity;
+				if (i < leftmostIdx) { leftmostIdx = i; leftmostId = id; }
+			}
+			if (leftmostId == null) continue;
+			const anchorEl = tabBar.querySelector(`.tab[data-id="${leftmostId}"]`);
 			if (!anchorEl) continue;
 			anchorEl.parentNode.insertBefore(
 				this._makeChip(doc, g, window),
@@ -896,6 +850,28 @@ var GroupTabsByCollection = {
 		return st?.groups.find((g) => g.tabIds.includes(tabId)) ?? null;
 	},
 
+	// Physically reorder grouped tabs so each group is a contiguous run, in the
+	// same order as `st.groups` (and each group's `tabIds`), placed right after
+	// the library tab.  Ungrouped tabs keep their relative order and end up after
+	// all groups.  This keeps the group-name chip anchorable to the leftmost
+	// member and re-heals groups that a stray native drag tried to split.
+	// Caller MUST have the tab-bar observer disconnected.
+	_reflowTabs(window) {
+		const ZoteroTabs = window.Zotero_Tabs;
+		const st = this._state.get(window);
+		if (!ZoteroTabs || !st) return;
+		let idx = 1; // leave the library tab at index 0
+		for (const g of st.groups) {
+			for (const tabId of g.tabIds) {
+				const live = ZoteroTabs._tabs || [];
+				if (!live.some((t) => t.id === tabId)) continue;
+				try { ZoteroTabs.move(tabId, idx); }
+				catch (e) { Zotero.debug(`GTBC: reflow move failed: ${e}`); }
+				idx++;
+			}
+		}
+	},
+
 	_addTabToGroup(window, tabId, targetGroup) {
 		const ZoteroTabs = window.Zotero_Tabs;
 		if (!ZoteroTabs) return;
@@ -910,19 +886,8 @@ var GroupTabsByCollection = {
 		if (!st.overrides) st.overrides = new Map();
 		st.overrides.set(tabId, targetGroup.key);
 
-		// Move tab to follow the last existing member of the target group.
-		const allTabs = ZoteroTabs._tabs || [];
-		const membersExceptNew = targetGroup.tabIds.slice(0, -1);
-		let insertAfterIdx = -1;
-		for (let i = 0; i < allTabs.length; i++) {
-			if (membersExceptNew.includes(allTabs[i].id)) insertAfterIdx = i;
-		}
-		if (insertAfterIdx >= 0) {
-			try { ZoteroTabs.move(tabId, insertAfterIdx + 1); }
-			catch (e) { Zotero.debug(`GTBC: move failed: ${e}`); }
-		}
-
 		if (st.tabBarObs) st.tabBarObs.disconnect();
+		this._reflowTabs(window);
 		this._renderGroupChips(window, "addToGroup");
 		if (st.tabBarObs) {
 			const tabBar = window.document.getElementById("tab-bar-container");
@@ -939,6 +904,7 @@ var GroupTabsByCollection = {
 		}
 		st.overrides?.delete(tabId);
 		if (st.tabBarObs) st.tabBarObs.disconnect();
+		this._reflowTabs(window);
 		this._renderGroupChips(window, "removeFromGroup");
 		if (st.tabBarObs) {
 			const tabBar = window.document.getElementById("tab-bar-container");
@@ -1055,6 +1021,7 @@ var GroupTabsByCollection = {
 				// Assign any new tabs to existing groups and physically move them
 				// BEFORE rendering, so the DOM is stable when tints/chips are applied.
 				this._autoAssignNewTabs(window);
+				this._reflowTabs(window);
 				this._renderGroupChips(window, "observer");
 				st.tabBarObs.observe(tabBar, { childList: true, subtree: true });
 			}, 60);
@@ -1062,18 +1029,60 @@ var GroupTabsByCollection = {
 
 		st.tabBarObs.observe(tabBar, { childList: true, subtree: true });
 
-		// Delegated drag handlers: track which tab is being dragged so chip
-		// drop targets can accept it without relying on dataTransfer type
+		// Delegated drag handlers: track which tab is being dragged so chip and
+		// tab drop targets can accept it without relying on dataTransfer type
 		// checks, which are unreliable in Gecko during dragover.
 		tabBar.addEventListener("dragstart", (e) => {
 			const tabEl = e.target.closest?.(".tab[data-id]");
 			if (!tabEl) return;
-			this._draggingTabId = tabEl.dataset.id;
-			e.dataTransfer.setData("text/plain", tabEl.dataset.id);
+			// Only reader/note tabs may be dragged into groups — never the
+			// library tab or other special tabs.
+			const tabId = tabEl.dataset.id;
+			const t = (window.Zotero_Tabs?._tabs || []).find((x) => x.id === tabId);
+			if (!t || !(t.type === "reader" || t.type === "reader-unloaded" || t.type === "note")) {
+				return;
+			}
+			this._draggingTabId = tabId;
+			e.dataTransfer.setData("text/plain", tabId);
 			e.dataTransfer.effectAllowed = "move";
 		});
 		tabBar.addEventListener("dragend", () => {
 			this._draggingTabId = null;
+			for (const el of tabBar.querySelectorAll(".gtbc-drop-into")) {
+				el.classList.remove("gtbc-drop-into");
+			}
+		});
+
+		// Make a group's whole tab-region a drop target, not just its chip:
+		// dropping a dragged tab onto any tab that belongs to a group adds the
+		// dragged tab to that same group.
+		tabBar.addEventListener("dragover", (e) => {
+			if (!this._draggingTabId) return;
+			const overEl = e.target.closest?.(".tab[data-gtbc-group]");
+			if (!overEl || overEl.dataset.id === this._draggingTabId) return;
+			e.preventDefault();
+			e.dataTransfer.dropEffect = "move";
+			if (!overEl.classList.contains("gtbc-drop-into")) {
+				for (const el of tabBar.querySelectorAll(".gtbc-drop-into")) {
+					el.classList.remove("gtbc-drop-into");
+				}
+				overEl.classList.add("gtbc-drop-into");
+			}
+		});
+		tabBar.addEventListener("drop", (e) => {
+			if (!this._draggingTabId) return;
+			const overEl = e.target.closest?.(".tab[data-gtbc-group]");
+			if (!overEl) return;
+			e.preventDefault();
+			e.stopPropagation();
+			overEl.classList.remove("gtbc-drop-into");
+			const key = overEl.dataset.gtbcGroup;
+			const draggedId = this._draggingTabId;
+			this._draggingTabId = null;
+			const group = this._state.get(window)?.groups.find((g) => g.key === key);
+			if (group && draggedId && !group.tabIds.includes(draggedId)) {
+				this._addTabToGroup(window, draggedId, group);
+			}
 		});
 	},
 
