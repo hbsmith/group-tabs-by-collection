@@ -6,10 +6,17 @@
  *  2. Injects a coloured chip before the first tab of each group.
  *  3. Click a chip to collapse/expand that group.
  *  4. Right-click a chip → "Close all tabs in …"
- *  5. Right-click a tab  → "Add to tab group …" submenu.
+ *  5. Right-click a tab  → "Move to group" submenu (existing groups, "New
+ *     group…", or "Remove from group").
  *  6. Right-click items in the item list → "Open in tab group(s)".
  *  7. A MutationObserver re-injects chips when React re-renders the tab bar,
  *     and auto-assigns any newly opened tabs to their matching group.
+ *
+ * Works across libraries: personal-library collections, shared/group-library
+ * subcollections, and a catch-all group for group-library items that aren't in
+ * any subcollection.  Groups are identified by a stable key (collection ID /
+ * library ID), never by display name, so same-named collections in different
+ * libraries stay distinct.  See the "Group identity & labelling" helper block.
  */
 var GroupTabsByCollection = {
 	id: null,
@@ -290,19 +297,52 @@ var GroupTabsByCollection = {
 
 		// No groups yet — full initial grouping.
 		const tabInfos = await this._buildTabInfos(readerTabs);
-		const conflicts = tabInfos.filter((ti) => ti.collections.length > 1);
+		const overrides = new Map(existingState?.overrides ?? []);
 
-		if (conflicts.length > 0) {
-			const proceed = this._handleConflicts(window, conflicts);
-			if (!proceed) return;
-		}
+		if (!this._resolveConflicts(window, tabInfos, overrides, existingState))
+			return;
 
-		const existingOverrides = existingState?.overrides ?? new Map();
-		this._applyGrouping(window, tabInfos, ZoteroTabs, existingOverrides);
-		this._buildGroupState(window, tabInfos, existingOverrides);
+		this._applyGrouping(window, tabInfos, ZoteroTabs, overrides);
+		this._buildGroupState(window, tabInfos, overrides);
 		this._renderGroupChips(window, "groupTabs");
 		this._setupTabBarObserver(window);
 		this._saveState(window);
+	},
+
+	// Resolve multi-collection (sibling) conflicts in place.  Policy:
+	//   1. Skip tabs that already have a manual override.
+	//   2. Prefer a candidate collection that already has a group — slot the tab
+	//      there silently, minimising fragmentation.
+	//   3. For anything still ambiguous, ask ONCE (batch dialog) and record the
+	//      chosen default as an override so the decision is remembered and the
+	//      user is never prompted for the same paper again.
+	// Returns false only if the user cancels the dialog.
+	_resolveConflicts(window, tabInfos, overrides, existingState) {
+		const existingKeys = new Set(
+			(existingState?.groups ?? []).map((g) => g.key)
+		);
+		const conflicts = tabInfos.filter(
+			(ti) =>
+				ti.descriptors.length > 1 &&
+				!ti.selected &&
+				!overrides.has(ti.tab.id)
+		);
+		if (conflicts.length === 0) return true;
+
+		const stillConflicting = [];
+		for (const ti of conflicts) {
+			const pref = ti.descriptors.find((d) => existingKeys.has(d.key));
+			if (pref) ti.selected = pref; // prefer-existing, not remembered
+			else stillConflicting.push(ti);
+		}
+		if (stillConflicting.length === 0) return true;
+
+		if (!this._handleConflicts(window, stillConflicting)) return false;
+		// Remember the resolved default so we don't ask again.
+		for (const ti of stillConflicting) {
+			if (ti.selected) overrides.set(ti.tab.id, ti.selected.key);
+		}
+		return true;
 	},
 
 	// Incremental grouping: called when groups already exist.
@@ -316,28 +356,34 @@ var GroupTabsByCollection = {
 		if (newTabs.length === 0) return;
 
 		const tabInfos = await this._buildTabInfos(newTabs);
-		const conflicts = tabInfos.filter((ti) => ti.collections.length > 1);
-		if (conflicts.length > 0) {
-			const proceed = this._handleConflicts(window, conflicts);
-			if (!proceed) return;
-		}
+		if (!st.overrides) st.overrides = new Map();
+		if (!this._resolveConflicts(window, tabInfos, st.overrides, st)) return;
 
-		// Create a group entry for any collection not yet represented.
-		// _renderGroupChips step 3 will handle assigning the actual tab IDs.
+		// Create an (empty) group entry for any group key not yet represented;
+		// _autoAssignNewTabs then assigns and physically positions the tabs.
+		const existingKeys = new Set(st.groups.map((g) => g.key));
 		const usedColors = new Set(st.groups.map((g) => g.color));
 		let ci = 0;
 		for (const ti of tabInfos) {
-			const colName = ti.selectedCollection?.name;
-			if (!colName) continue;
-			if (st.groups.find((g) => g.name === colName)) continue;
+			const key = st.overrides.get(ti.tab.id) ?? ti.selected?.key;
+			if (!key || existingKeys.has(key)) continue;
+			const desc = ti.descriptors.find((d) => d.key === key) ?? ti.selected;
+			if (!desc) continue;
+			existingKeys.add(key);
 			while (usedColors.has(this.COLORS[ci % this.COLORS.length])) ci++;
 			const color = this.COLORS[ci++ % this.COLORS.length];
 			usedColors.add(color);
-			st.groups.push({ name: colName, color, tabIds: [], collapsed: true });
+			st.groups.push({
+				...this._descriptorFromGroup(desc),
+				color,
+				tabIds: [],
+				collapsed: true,
+			});
 		}
-		st.groups.sort((a, b) => a.name.localeCompare(b.name));
+		st.groups.sort((a, b) => this._compareGroups(a, b));
 
 		if (st.tabBarObs) st.tabBarObs.disconnect();
+		this._autoAssignNewTabs(window);
 		this._renderGroupChips(window, "groupTabs");
 		const tabBar = window.document.getElementById("tab-bar-container");
 		if (st.tabBarObs && tabBar) st.tabBarObs.observe(tabBar, { childList: true, subtree: true });
@@ -348,25 +394,14 @@ var GroupTabsByCollection = {
 		const infos = [];
 		for (const tab of tabs) {
 			const item = this._getParentItem(tab.data?.itemID);
-			let collections = [];
-
-			if (item) {
-				const raw = item
-					.getCollections()
-					.map((id) => Zotero.Collections.get(id))
-					.filter(Boolean);
-				// Drop ancestor collections: only keep the most specific
-				// (deepest) collections. This prevents "Neuroscience >
-				// Schizophrenia" from showing as a multi-collection conflict.
-				collections = this._filterToLeafCollections(raw);
-			}
-
+			// Candidate group descriptors, ancestor collections already dropped.
+			// A single candidate is unambiguous; >1 is a genuine sibling conflict.
+			const descriptors = this._candidateDescriptors(item);
 			infos.push({
 				tab,
 				item,
-				collections,
-				selectedCollection:
-					collections.length === 1 ? collections[0] : null,
+				descriptors,
+				selected: descriptors.length === 1 ? descriptors[0] : null,
 			});
 		}
 		return infos;
@@ -374,9 +409,9 @@ var GroupTabsByCollection = {
 
 	_handleConflicts(window, conflicts) {
 		for (const ci of conflicts) {
-			ci.selectedCollection = ci.collections
+			ci.selected = ci.descriptors
 				.slice()
-				.sort((a, b) => a.name.localeCompare(b.name))[0];
+				.sort((a, b) => this._compareGroups(a, b))[0];
 		}
 
 		const lines = conflicts.map((ci) => {
@@ -384,11 +419,14 @@ var GroupTabsByCollection = {
 				ci.item?.getDisplayTitle?.() || ci.tab.title || "Untitled",
 				52
 			);
-			const all = ci.collections.map((c) => c.name).sort().join(", ");
+			const all = ci.descriptors
+				.map((d) => this._descriptorDisplay(d))
+				.sort()
+				.join(", ");
 			return (
 				`\u2022 "${title}"\n` +
 				`   In: ${all}\n` +
-				`   \u2192 Will group under: ${ci.selectedCollection.name}`
+				`   \u2192 Will group under: ${this._descriptorDisplay(ci.selected)}`
 			);
 		});
 
@@ -418,27 +456,26 @@ var GroupTabsByCollection = {
 		);
 	},
 
-	_applyGrouping(window, tabInfos, ZoteroTabs, overrides = new Map()) {
-		// Build groups using override name (if any) in place of collection name
-		// so manually-moved tabs end up physically next to their assigned group.
+	_applyGrouping(window, tabInfos, ZoteroTabs, overrides = new Map(), knownGroups = new Map()) {
+		// Build groups by stable key (override key if any, else the tab's single
+		// candidate) so manually-moved tabs end up physically next to their group.
 		const groups = new Map();
 		const uncollected = [];
 
 		for (const ti of tabInfos) {
-			const overrideName = overrides.get(ti.tab.id);
-			const groupName = overrideName ?? ti.selectedCollection?.name;
-			if (!groupName) { uncollected.push(ti); continue; }
-			if (!groups.has(groupName)) {
-				groups.set(groupName, {
-					collection: overrideName ? { name: overrideName } : ti.selectedCollection,
-					items: [],
-				});
-			}
-			groups.get(groupName).items.push(ti);
+			const key = overrides.get(ti.tab.id) ?? ti.selected?.key;
+			if (!key) { uncollected.push(ti); continue; }
+			const desc =
+				ti.descriptors.find((d) => d.key === key) ??
+				knownGroups.get(key) ??
+				ti.selected;
+			if (!desc) { uncollected.push(ti); continue; }
+			if (!groups.has(key)) groups.set(key, { descriptor: desc, items: [] });
+			groups.get(key).items.push(ti);
 		}
 
 		const sorted = Array.from(groups.values()).sort((a, b) =>
-			a.collection.name.localeCompare(b.collection.name)
+			this._compareGroups(a.descriptor, b.descriptor)
 		);
 
 		let idx = 1;
@@ -456,7 +493,7 @@ var GroupTabsByCollection = {
 
 	// ── Group state & chip rendering ──────────────────────────────────────────
 
-	_buildGroupState(window, tabInfos, overrides = new Map()) {
+	_buildGroupState(window, tabInfos, overrides = new Map(), knownGroups = new Map()) {
 		// Cancel any in-flight debounce timer from the old state before
 		// replacing it, so the old observer callback cannot fire after we set
 		// up the new state and inadvertently reconnect a dead observer.
@@ -466,31 +503,44 @@ var GroupTabsByCollection = {
 			if (existing.debounceTimer) window.clearTimeout(existing.debounceTimer);
 		}
 
-		// Preserve colour and collapsed state for groups that already existed.
-		const existingByName = new Map(
-			(existing?.groups ?? []).map((g) => [g.name, g])
+		// Preserve colour and collapsed state for groups that already existed,
+		// keyed by stable group key (not name — names can collide across libraries).
+		const existingByKey = new Map(
+			(existing?.groups ?? []).map((g) => [g.key, g])
 		);
 
 		const groups = [];
-		const nameToGroup = new Map();
+		const byKey = new Map();
 
+		// Assign each tab to its effective group (manual override wins over the
+		// tab's own single candidate).  Build the group entry on first sight,
+		// resolving its descriptor from the tab's candidates, the caller-supplied
+		// known groups (saved/custom), or the previous state.
 		for (const ti of tabInfos) {
-			const c = ti.selectedCollection;
-			if (!c) continue;
-			if (!nameToGroup.has(c.name)) {
-				const prev = existingByName.get(c.name);
-				nameToGroup.set(c.name, {
-					name: c.name,
-					color: prev?.color ?? null,     // filled in below for new groups
-					tabIds: [],
+			const key = overrides.get(ti.tab.id) ?? ti.selected?.key;
+			if (!key) continue;
+			let entry = byKey.get(key);
+			if (!entry) {
+				const prev = existingByKey.get(key);
+				const desc =
+					ti.descriptors.find((d) => d.key === key) ??
+					knownGroups.get(key) ??
+					(prev ? this._descriptorFromGroup(prev) : null) ??
+					ti.selected;
+				if (!desc) continue; // unresolvable override target → leave ungrouped
+				entry = {
+					...this._descriptorFromGroup(desc),
+					color: prev?.color ?? null,         // filled in below for new groups
 					collapsed: prev?.collapsed ?? null, // filled in below for new groups
-				});
-				groups.push(nameToGroup.get(c.name));
+					tabIds: [],
+				};
+				byKey.set(key, entry);
+				groups.push(entry);
 			}
-			nameToGroup.get(c.name).tabIds.push(ti.tab.id);
+			if (!entry.tabIds.includes(ti.tab.id)) entry.tabIds.push(ti.tab.id);
 		}
 
-		groups.sort((a, b) => a.name.localeCompare(b.name));
+		groups.sort((a, b) => this._compareGroups(a, b));
 
 		// Assign colours to new groups, skipping colours already in use so
 		// re-grouping doesn't change existing groups' colours.
@@ -512,30 +562,14 @@ var GroupTabsByCollection = {
 			if (g.collapsed === null) g.collapsed = true;
 		}
 
-		// Apply manual overrides: move tabs from their collection-assigned group
-		// to the group the user explicitly chose.  Do this after colour/collapse
-		// assignment so the overridden group still gets its usual styling.
-		const openTabIdSet = new Set(tabInfos.map(ti => ti.tab.id));
-		const groupNameSet = new Set(groups.map(g => g.name));
 		// Prune stale overrides (tab closed, or target group no longer exists).
-		for (const [tabId, targetName] of overrides) {
-			if (!openTabIdSet.has(tabId) || !groupNameSet.has(targetName)) {
+		const openTabIdSet = new Set(tabInfos.map((ti) => ti.tab.id));
+		const groupKeySet = new Set(groups.map((g) => g.key));
+		for (const [tabId, key] of overrides) {
+			if (!openTabIdSet.has(tabId) || !groupKeySet.has(key)) {
 				overrides.delete(tabId);
 			}
 		}
-		// Apply valid overrides.
-		for (const [tabId, targetName] of overrides) {
-			const target = groups.find(g => g.name === targetName);
-			if (!target) continue;
-			for (const g of groups) {
-				if (g !== target) g.tabIds = g.tabIds.filter(id => id !== tabId);
-			}
-			if (!target.tabIds.includes(tabId)) target.tabIds.push(tabId);
-		}
-		// Remove any groups left empty after override application.
-		const nonEmpty = groups.filter(g => g.tabIds.length > 0);
-		groups.length = 0;
-		nonEmpty.forEach(g => groups.push(g));
 
 		this._state.set(window, { groups, tabBarObs: null, debounceTimer: null, overrides });
 	},
@@ -563,6 +597,7 @@ var GroupTabsByCollection = {
 		// 3. Auto-assign newly opened tabs that belong to an existing group.
 		//    Manual overrides take precedence over collection-based assignment.
 		const overrides = st.overrides ?? new Map();
+		const groupByKey = new Map(st.groups.map((g) => [g.key, g]));
 		const groupedIds = new Set(st.groups.flatMap((g) => g.tabIds));
 		const allReaderTabs = (ZoteroTabs?._tabs || []).filter(
 			(t) => t.type === "reader" || t.type === "reader-unloaded" || t.type === "note"
@@ -570,23 +605,19 @@ var GroupTabsByCollection = {
 		for (const tab of allReaderTabs) {
 			if (groupedIds.has(tab.id)) continue;
 			// Honour manual override first.
-			const overrideName = overrides.get(tab.id);
-			if (overrideName) {
-				const target = st.groups.find(g => g.name === overrideName);
+			const overrideKey = overrides.get(tab.id);
+			if (overrideKey) {
+				const target = groupByKey.get(overrideKey);
 				if (target) {
 					target.tabIds.push(tab.id);
 					groupedIds.add(tab.id);
 				}
 				continue;
 			}
-			// Fall back to collection-based assignment.
+			// Fall back to collection/library-based assignment.
 			const item = this._getParentItem(tab.data?.itemID);
-			if (!item) continue;
-			const raw = item.getCollections()
-				.map((id) => Zotero.Collections.get(id)).filter(Boolean);
-			const cols = this._filterToLeafCollections(raw);
-			const match = cols
-				.map((c) => st.groups.find((g) => g.name === c.name))
+			const match = this._candidateDescriptors(item)
+				.map((d) => groupByKey.get(d.key))
 				.find(Boolean);
 			if (match) {
 				match.tabIds.push(tab.id);
@@ -609,7 +640,7 @@ var GroupTabsByCollection = {
 				if (!el) continue;
 				el.style.display = g.collapsed ? "none" : "";
 				el.style.backgroundColor = tint;
-				el.dataset.gtbcGroup = g.name;
+				el.dataset.gtbcGroup = g.key;
 				el.setAttribute("draggable", "true");
 			}
 		}
@@ -637,6 +668,7 @@ var GroupTabsByCollection = {
 		if (!ZoteroTabs) return;
 
 		const overrides = st.overrides ?? new Map();
+		const groupByKey = new Map(st.groups.map((g) => [g.key, g]));
 		const groupedIds = new Set(st.groups.flatMap((g) => g.tabIds));
 		const allReaderTabs = (ZoteroTabs._tabs || []).filter(
 			(t) => t.type === "reader" || t.type === "reader-unloaded" || t.type === "note"
@@ -646,17 +678,15 @@ var GroupTabsByCollection = {
 			if (groupedIds.has(tab.id)) continue;
 
 			// Manual override takes precedence over collection matching.
-			const overrideName = overrides.get(tab.id);
+			const overrideKey = overrides.get(tab.id);
 			let match = null;
-			if (overrideName) {
-				match = st.groups.find((g) => g.name === overrideName);
+			if (overrideKey) {
+				match = groupByKey.get(overrideKey);
 			} else {
 				const item = this._getParentItem(tab.data?.itemID);
-				if (!item) continue;
-				const raw = item.getCollections()
-					.map((id) => Zotero.Collections.get(id)).filter(Boolean);
-				const cols = this._filterToLeafCollections(raw);
-				match = cols.map((c) => st.groups.find((g) => g.name === c.name)).find(Boolean);
+				match = this._candidateDescriptors(item)
+					.map((d) => groupByKey.get(d.key))
+					.find(Boolean);
 			}
 			if (!match) continue;
 
@@ -680,11 +710,14 @@ var GroupTabsByCollection = {
 	_makeChip(doc, group, window) {
 		const chip = doc.createElement("div");
 		chip.className = "gtbc-chip";
-		chip.dataset.gtbcGroup = group.name;
+		chip.dataset.gtbcGroup = group.key;
 		chip.style.setProperty("--gtbc-color", group.color);
 
 		const n = group.tabIds.length;
-		const nameText = this._escapeHtml(this._truncate(group.name, 18));
+		// Personal collections show just the folder name; shared-library
+		// subcollections show a short library prefix + folder (full lineage in
+		// the tooltip).
+		const nameText = this._escapeHtml(this._chipLabel(group));
 
 		chip.className = `gtbc-chip${group.collapsed ? "" : " gtbc-chip--expanded"}`;
 		chip.innerHTML =
@@ -692,9 +725,7 @@ var GroupTabsByCollection = {
 			`<span class="gtbc-chip-name">${nameText}</span>` +
 			`<span class="gtbc-chip-count">(${n})</span>`;
 
-		chip.title = group.collapsed
-			? `Expand "${group.name}" — ${n} tab${n === 1 ? "" : "s"}`
-			: `Collapse "${group.name}" — ${n} tab${n === 1 ? "" : "s"}`;
+		chip.title = this._chipTooltip(group);
 
 		const _toggleCollapse = () => {
 			group.collapsed = !group.collapsed;
@@ -770,7 +801,10 @@ var GroupTabsByCollection = {
 		const closeAll = doc.createElementNS(XUL, "menuitem");
 		closeAll.setAttribute(
 			"label",
-			`Close all tabs in "${this._truncate(group.name, 30)}"`
+			`Close all tabs in "${this._truncate(
+				this._descriptorDisplay(this._descriptorFromGroup(group)),
+				30
+			)}"`
 		);
 		closeAll.addEventListener("command", () =>
 			this._closeGroupTabs(window, group)
@@ -817,7 +851,11 @@ var GroupTabsByCollection = {
 			const isCurrent = g === currentGroup;
 			mi.setAttribute(
 				"label",
-				(isCurrent ? "\u2713 " : "") + this._truncate(g.name, 35)
+				(isCurrent ? "\u2713 " : "") +
+					this._truncate(
+						this._descriptorDisplay(this._descriptorFromGroup(g)),
+						35
+					)
 			);
 			if (isCurrent) mi.setAttribute("disabled", "true");
 			mi.addEventListener("command", () =>
@@ -825,6 +863,15 @@ var GroupTabsByCollection = {
 			);
 			addPopup.appendChild(mi);
 		}
+
+		// Let the user spin the tab off into a brand-new group.
+		addPopup.appendChild(doc.createElementNS(XUL, "menuseparator"));
+		const newGroup = doc.createElementNS(XUL, "menuitem");
+		newGroup.setAttribute("label", "New group\u2026");
+		newGroup.addEventListener("command", () =>
+			this._createGroupFromTab(window, tabId)
+		);
+		addPopup.appendChild(newGroup);
 
 		if (currentGroup) {
 			addPopup.appendChild(doc.createElementNS(XUL, "menuseparator"));
@@ -861,7 +908,7 @@ var GroupTabsByCollection = {
 		targetGroup.tabIds.push(tabId);
 		// Record manual override so this assignment survives re-grouping.
 		if (!st.overrides) st.overrides = new Map();
-		st.overrides.set(tabId, targetGroup.name);
+		st.overrides.set(tabId, targetGroup.key);
 
 		// Move tab to follow the last existing member of the target group.
 		const allTabs = ZoteroTabs._tabs || [];
@@ -898,6 +945,48 @@ var GroupTabsByCollection = {
 			if (tabBar) st.tabBarObs.observe(tabBar, { childList: true, subtree: true });
 		}
 		this._saveState(window);
+	},
+
+	// Prompt for a name and move the tab into a fresh, user-named group.  Custom
+	// groups carry no collection identity (key "custom:…") and live alongside the
+	// personal-library groups in the ordering.
+	_createGroupFromTab(window, tabId) {
+		const st = this._state.get(window);
+		if (!st) return;
+
+		const input = { value: "" };
+		const ok = Services.prompt.prompt(
+			window,
+			"New Tab Group",
+			"Name for the new group:",
+			input,
+			null,
+			{ value: false }
+		);
+		const label = ok ? input.value.trim() : "";
+		if (!label) return;
+
+		const used = new Set(st.groups.map((g) => g.color));
+		let ci = 0;
+		while (used.has(this.COLORS[ci % this.COLORS.length])) ci++;
+		const color = this.COLORS[ci % this.COLORS.length];
+
+		const group = {
+			key: "custom:" + Date.now() + ":" + Math.random().toString(36).slice(2, 7),
+			libraryID: null,
+			collectionID: null,
+			name: label,
+			path: [label],
+			libraryName: "",
+			isGroupLibrary: false,
+			color,
+			tabIds: [],
+			collapsed: false,
+		};
+		st.groups.push(group);
+		st.groups.sort((a, b) => this._compareGroups(a, b));
+		// _addTabToGroup records the override, repositions, re-renders, and saves.
+		this._addTabToGroup(window, tabId, group);
 	},
 
 	// ── Item context menu: "Open in tab group(s)" ────────────────────────────
@@ -1002,14 +1091,27 @@ var GroupTabsByCollection = {
 
 		// Tab IDs are ephemeral — translate overrides to itemId keys for storage.
 		const itemOverrides = {};
-		for (const [tabId, groupName] of (st.overrides ?? new Map())) {
+		for (const [tabId, groupKey] of (st.overrides ?? new Map())) {
 			const tab = allTabs.find((t) => t.id === tabId);
 			const itemID = tab?.data?.itemID;
-			if (itemID) itemOverrides[String(itemID)] = groupName;
+			if (itemID) itemOverrides[String(itemID)] = groupKey;
 		}
 
+		// Persist the full group descriptor (keyed by stable key) so library-root
+		// and custom groups — which aren't re-derivable from a single collection —
+		// can be reconstructed on restore.
 		const data = {
-			groups: st.groups.map((g) => ({ name: g.name, color: g.color, collapsed: g.collapsed })),
+			groups: st.groups.map((g) => ({
+				key: g.key,
+				libraryID: g.libraryID,
+				collectionID: g.collectionID,
+				name: g.name,
+				path: g.path,
+				libraryName: g.libraryName,
+				isGroupLibrary: g.isGroupLibrary,
+				color: g.color,
+				collapsed: g.collapsed,
+			})),
 			overrides: itemOverrides,
 		};
 
@@ -1048,32 +1150,41 @@ var GroupTabsByCollection = {
 		);
 		if (readerTabs.length === 0) return;
 
+		// Saved groups keyed by their stable key; also used to resolve descriptors
+		// for override targets that aren't re-derivable from a tab's collections.
+		const savedByKey = new Map(data.groups.map((g) => [g.key, g]));
+		const savedKeys = new Set(savedByKey.keys());
+		const knownGroups = new Map(
+			data.groups.map((g) => [g.key, this._descriptorFromGroup(g)])
+		);
+
 		const tabInfos = await this._buildTabInfos(readerTabs);
-		// Auto-resolve multi-collection conflicts silently on restore.
-		for (const ti of tabInfos.filter((ti) => ti.collections.length > 1)) {
-			ti.selectedCollection = ti.collections
-				.slice()
-				.sort((a, b) => a.name.localeCompare(b.name))[0];
+		// Auto-resolve multi-collection conflicts silently on restore: prefer a
+		// candidate that maps to a saved group, else fall back to the first by
+		// the standard ordering.
+		for (const ti of tabInfos.filter((ti) => ti.descriptors.length > 1 && !ti.selected)) {
+			ti.selected =
+				ti.descriptors.find((d) => savedKeys.has(d.key)) ??
+				ti.descriptors.slice().sort((a, b) => this._compareGroups(a, b))[0];
 		}
 
 		// Translate saved itemId overrides back to current tab IDs.
 		const overrides = new Map();
 		for (const ti of tabInfos) {
 			const itemID = ti.tab.data?.itemID;
-			const savedGroup = itemID && data.overrides?.[String(itemID)];
-			if (savedGroup) overrides.set(ti.tab.id, savedGroup);
+			const savedKey = itemID && data.overrides?.[String(itemID)];
+			if (savedKey) overrides.set(ti.tab.id, savedKey);
 		}
 
-		this._applyGrouping(window, tabInfos, ZoteroTabs, overrides);
-		this._buildGroupState(window, tabInfos, overrides);
+		this._applyGrouping(window, tabInfos, ZoteroTabs, overrides, knownGroups);
+		this._buildGroupState(window, tabInfos, overrides, knownGroups);
 
 		// Overlay the saved colours and collapsed states.  _buildGroupState
 		// assigns defaults for "new" groups; we want the user's last-seen values.
 		const st = this._state.get(window);
 		if (st) {
-			const savedByName = new Map(data.groups.map((g) => [g.name, g]));
 			for (const g of st.groups) {
-				const saved = savedByName.get(g.name);
+				const saved = savedByKey.get(g.key);
 				if (saved) {
 					g.color = saved.color;
 					g.collapsed = saved.collapsed;
@@ -1131,6 +1242,147 @@ var GroupTabsByCollection = {
 		// Keep only collections that are NOT an ancestor of another in the list.
 		const leaves = collections.filter((c) => !ancestorIds.has(c.id));
 		return leaves.length > 0 ? leaves : collections;
+	},
+
+	// ── Group identity & labelling ────────────────────────────────────────────
+	//
+	// A group is identified by a stable `key`, NOT by its display name — two
+	// collections in different libraries can share a name (e.g. a "Reading"
+	// folder in both My Library and a shared group), and keying on the name
+	// would silently merge them.  Keys:
+	//   "col:<collectionID>"  — a collection (personal or group library)
+	//   "lib:<libraryID>"     — the catch-all for group-library items that are
+	//                            in the library but in no subcollection
+	//   "custom:<…>"          — a user-created group (via "New group…")
+	//
+	// A *descriptor* carries everything needed to render and sort a group:
+	//   { key, libraryID, collectionID, name, path, libraryName, isGroupLibrary }
+	// where `name` is the leaf label, `path` is the collection-name chain from
+	// top-level down to the leaf, and `isGroupLibrary` is true for shared groups.
+
+	_libraryInfo(libraryID) {
+		let lib = null;
+		try { lib = Zotero.Libraries.get(libraryID); } catch (e) {}
+		const userID = Zotero.Libraries.userLibraryID;
+		return {
+			name: lib?.name ?? "Library",
+			// Anything that isn't the personal library is treated as "shared" for
+			// labelling purposes (group libraries, and the harmless edge cases of
+			// feeds / My Publications, which simply get their name shown).
+			isGroupLibrary: libraryID !== userID,
+		};
+	},
+
+	_descriptorForCollection(col) {
+		// Walk up to build the full name path (top-level → leaf).
+		const path = [];
+		const seen = new Set();
+		let cur = col;
+		while (cur && !seen.has(cur.id)) {
+			seen.add(cur.id);
+			path.unshift(cur.name);
+			cur = cur.parentID ? Zotero.Collections.get(cur.parentID) : null;
+		}
+		const { name: libraryName, isGroupLibrary } = this._libraryInfo(col.libraryID);
+		return {
+			key: "col:" + col.id,
+			libraryID: col.libraryID,
+			collectionID: col.id,
+			name: col.name,
+			path,
+			libraryName,
+			isGroupLibrary,
+		};
+	},
+
+	_descriptorForLibraryRoot(libraryID) {
+		const { name: libraryName, isGroupLibrary } = this._libraryInfo(libraryID);
+		return {
+			key: "lib:" + libraryID,
+			libraryID,
+			collectionID: null,
+			name: libraryName,
+			path: [libraryName],
+			libraryName,
+			isGroupLibrary,
+		};
+	},
+
+	// Candidate group descriptors for an item, in priority order.
+	//  - Items in one or more (leaf) collections → one descriptor per collection.
+	//  - Group-library items in NO subcollection → a single library-root group.
+	//  - Personal-library items in no collection → [] (left ungrouped).
+	_candidateDescriptors(item) {
+		if (!item) return [];
+		const raw = item
+			.getCollections()
+			.map((id) => Zotero.Collections.get(id))
+			.filter(Boolean);
+		const leaves = this._filterToLeafCollections(raw);
+		if (leaves.length > 0) {
+			return leaves.map((c) => this._descriptorForCollection(c));
+		}
+		const { isGroupLibrary } = this._libraryInfo(item.libraryID);
+		if (isGroupLibrary) return [this._descriptorForLibraryRoot(item.libraryID)];
+		return [];
+	},
+
+	_descriptorFromGroup(g) {
+		return {
+			key: g.key,
+			libraryID: g.libraryID,
+			collectionID: g.collectionID,
+			name: g.name,
+			path: g.path,
+			libraryName: g.libraryName,
+			isGroupLibrary: g.isGroupLibrary,
+		};
+	},
+
+	// Stable ordering: personal-library groups first, then each shared library
+	// (grouped together), and within a library by collection path.
+	_compareGroups(a, b) {
+		const ax = a?.isGroupLibrary ? 1 : 0;
+		const bx = b?.isGroupLibrary ? 1 : 0;
+		if (ax !== bx) return ax - bx;
+		const al = (a?.libraryName ?? "").toLowerCase();
+		const bl = (b?.libraryName ?? "").toLowerCase();
+		if (al !== bl) return al < bl ? -1 : 1;
+		const ap = (a?.path ?? [a?.name ?? ""]).join(" ").toLowerCase();
+		const bp = (b?.path ?? [b?.name ?? ""]).join(" ").toLowerCase();
+		if (ap !== bp) return ap < bp ? -1 : 1;
+		return 0;
+	},
+
+	// Compact chip label (~20 char budget):
+	//  - Personal collection / shared-library root / custom group → leaf name.
+	//  - Shared-library subcollection → short library prefix + leaf folder, e.g.
+	//    "Neuro·Schizophreni…" (full lineage lives in the tooltip).
+	_chipLabel(group) {
+		const BUDGET = 20;
+		if (group.isGroupLibrary && group.collectionID !== null) {
+			const libPart = (group.libraryName || "").slice(0, 5);
+			const leafBudget = Math.max(5, BUDGET - libPart.length - 1);
+			return libPart + "·" + this._truncate(group.name, leafBudget);
+		}
+		return this._truncate(group.name, BUDGET);
+	},
+
+	// Full, untruncated lineage for tooltips / menus: "Library › Parent › Leaf"
+	// for shared subcollections; the plain path otherwise.
+	_descriptorDisplay(d) {
+		const path =
+			d.isGroupLibrary && d.collectionID !== null
+				? [d.libraryName, ...d.path]
+				: d.path;
+		return path.join(" › ");
+	},
+
+	_chipTooltip(group) {
+		const n = group.tabIds.length;
+		const lineage = this._descriptorDisplay(this._descriptorFromGroup(group));
+		const verb = group.collapsed ? "Expand" : "Collapse";
+		return `${verb} “${lineage}” — ${n} tab${n === 1 ? "" : "s"}`;
 	},
 
 	_hexToRgba(hex, alpha) {

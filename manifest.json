@@ -1,7 +1,7 @@
 {
 	"manifest_version": 2,
 	"name": "Group Tabs by Collection",
-	"version": "1.2.0",
+	"version": "1.3.0",
 	"description": "Groups open reader/snapshot tabs by Zotero collection. Suggests resolutions for items in multiple collections.",
 	"icons": {
 		"48": "content/icons/favicon.svg",

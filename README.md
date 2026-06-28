@@ -13,7 +13,7 @@ When you have many PDFs or snapshots open at once, the Zotero tab bar becomes a 
 - A coloured **group chip** appears before each collection's first tab, labelled with the collection name.
 - **Click a chip** to collapse the group — the tabs fold away and the chip shows a count badge. Click again to expand.
 - **Right-click a chip** for a context menu with **"Close all tabs in …"**.
-- **Right-click a tab** for a **"Move to group"** submenu to reassign it to any existing group, or **"Remove from group"** to ungroup it entirely.
+- **Right-click a tab** for a **"Move to group"** submenu to reassign it to any existing group, start a **"New group…"** for it, or **"Remove from group"** to ungroup it entirely.
 - **Drag a tab** onto a group chip to move it into that group.
 - Manual assignments (via right-click or drag) **persist** — they survive the button being clicked again and Zotero restarts.
 - **Right-click items** in the item list for an **"Open in tab group(s)"** option that opens and groups them in one step.
@@ -21,7 +21,8 @@ When you have many PDFs or snapshots open at once, the Zotero tab bar becomes a 
 - Opening a PDF from a collection that already has a group **automatically slots it in** — the group chip and tint appear without any action needed.
 - Up to 8 distinct colours are assigned automatically (blue, green, orange, purple, teal, rose, amber, indigo).
 - Tabs within a group are tinted with that group's colour.
-- Items with no collection are placed at the end, ungrouped.
+- **Shared / group libraries are supported.** Papers in a shared group are grouped by their subcollection just like your personal library; those that sit in a shared library but in no subcollection are gathered into one group named after the library. Group chips for shared collections are prefixed with a short form of the library name (e.g. `Neuro·Schizophrenia`) so collections that share a name across libraries stay distinct; the full path appears in the chip's tooltip.
+- Items in your personal library with no collection are placed at the end, ungrouped.
 - **Group state is restored automatically** after a Zotero restart — groups, colours, collapsed state, and manual assignments all come back within a couple of seconds of opening Zotero.
 
 ## Usage
@@ -37,10 +38,12 @@ When you have many PDFs or snapshots open at once, the Zotero tab bar becomes a 
 
 **Subsequent runs** (groups already exist): the button only processes tabs that are not yet assigned to any group. Already-grouped tabs — including any you have manually moved — are left exactly where they are. If an ungrouped tab belongs to a collection that already has a group, it is added to that group. If it belongs to a new collection, a new group is created for it. This means you can open a handful of new papers, click the button once, and only those new papers are slotted in, without disturbing anything else.
 
-If a tab's item belongs to **multiple collections**, behaviour depends on how it was opened:
-- **Via the button**: a confirmation dialog lists each conflict and suggests placing the tab under the first matching collection alphabetically. You can proceed or cancel.
-- **Via auto-assign** (tab opened directly from the library while groups are active): the tab is silently placed into the first group whose collection name matches, with no prompt.
-- **On restart restore**: conflicts are resolved silently using the same alphabetical default.
+If a tab's item belongs to **multiple (sibling) collections**, the plugin first tries to avoid asking: if one of those collections **already has a group**, the tab is slotted there automatically. Only when none of them does:
+- **Via the button**: a confirmation dialog lists each remaining conflict and its suggested collection. If you proceed, the choice is **remembered** (stored as a manual assignment) so you are never prompted for that paper again. You can still move it afterwards via right-click or drag.
+- **Via auto-assign** (tab opened directly from the library while groups are active): the tab is silently placed into the first matching group, with no prompt.
+- **On restart restore**: conflicts are resolved silently, preferring a collection that matches a saved group.
+
+(A paper can only live in one group at a time, since a group is a contiguous run of tabs and a tab can't be in two places at once.)
 
 ## Installation
 
