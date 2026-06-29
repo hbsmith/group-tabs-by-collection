@@ -14,7 +14,8 @@ When you have many PDFs or snapshots open at once, the Zotero tab bar becomes a 
 - **Click a chip** to collapse the group — the tabs fold away and the chip shows a count badge. Click again to expand.
 - **Right-click a chip** for a context menu with **"Close all tabs in …"**.
 - **Right-click a tab** for a **"Move to group"** submenu to reassign it to any existing group, start a **"New group…"** for it, or **"Remove from group"** to ungroup it entirely.
-- **Drag a tab** onto a group chip — or onto any tab already in the group — to move it into that group. Any tab can be dragged, whether or not it's currently grouped.
+- **Drag a tab** to reorder it within its group (or to reorder ungrouped tabs). Dragging only rearranges — to move a tab between groups or remove it from a group, use the right-click menu.
+- **Drag a group chip** to reorder whole groups in the tab bar; the order you set is remembered.
 - Manual assignments (via right-click or drag) **persist** — they survive the button being clicked again and Zotero restarts.
 - **Right-click items** in the item list for an **"Open in tab group(s)"** option that opens and groups them in one step.
 - When there are multiple groups, all start **collapsed** so you get an instant overview. When everything belongs to one collection the group starts expanded (collapsing it would leave nothing visible).

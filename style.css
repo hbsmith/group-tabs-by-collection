@@ -101,10 +101,14 @@
 	outline-offset: 1px;
 }
 
-/* Drop-target highlight when a tab is dragged over another group's tab */
-.tab.gtbc-drop-into {
-	outline: 2px solid rgba(255, 255, 255, 0.8);
-	outline-offset: -2px;
+/* Cursor insertion indicator while dragging a tab: a bar on the side of the
+   target tab showing where the dragged tab will land. !important so it shows
+   over the selected-tab box-shadow during a drag. */
+.tab.gtbc-insert-before {
+	box-shadow: inset 3px 0 0 0 #4d6b8a !important;
+}
+.tab.gtbc-insert-after {
+	box-shadow: inset -3px 0 0 0 #4d6b8a !important;
 }
 
 /* ── Selected-tab emphasis ───────────────────────────────────────────────── */
